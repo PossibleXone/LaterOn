@@ -469,6 +469,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     })();
     return true;
   }
+  // 侧栏浮层里已经选好了项目，这里只负责写库。
+  if (message.type === "SAVE_TAB_TO_PROJECT") {
+    saveTabToProject({
+      tabId: message.tabId ?? null,
+      projectId: message.projectId || null,
+      source: message.source || "panel"
+    })
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+    return true;
+  }
 });
 
 // 快捷键触发：先记一笔「确实收到了按键」，再执行。
@@ -558,6 +569,47 @@ async function quickSave(tab, source = "shortcut") {
   await showPagePills(tab.id, [message]).catch(() => {});
   // 把结果回传，好让侧边栏 / 工具栏小窗口的按钮显示正确的字样。
   return { ok: true, duplicated: !!saved.duplicated, refreshed: !!saved.refreshed, updated: !!saved.updated };
+}
+
+// 侧栏浮层已经选好了项目：把当前标签页直接写进那个项目。
+// 刻意不走 quickSave —— 那条路会读 shouldAskFolderForSingle、写 PENDING_KEY、
+// 再往网页里弹一个选项目浮层，和侧栏刚弹过的重复，还会和批量收藏的待确认批次打架。
+async function saveTabToProject({ tabId = null, projectId = null, source = "panel" } = {}) {
+  const en = await usesEnglish();
+  const tab = tabId
+    ? await chrome.tabs.get(tabId).catch(() => null)
+    : (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+  if (!tab?.id || !isWebUrl(tab.url)) {
+    return { ok: false, error: en ? "The current page can’t be added" : "当前页面无法添加" };
+  }
+  // 项目可能在浮层打开期间被别处删掉：resolveProject 会校验，不存在就回落「等待整理」。
+  const chosen = await resolveProject(projectId);
+  const meta = await extractTabMetadata(tab);
+  const saved = await upsertItemForProject(meta, chosen.id);
+  await recordDiag({
+    lastTrigger: source,
+    lastStage: chosen.id ? "已添加到项目" : "已添加到等待整理",
+    lastStageAt: Date.now(),
+    lastResultAt: Date.now(),
+    lastCoverFrom: meta.imageFrom || "none",
+    lastTitleFrom: meta.titleFrom || "none",
+    lastCoverTitle: String(meta.title || "").slice(0, 60),
+    lastCoverAt: Date.now()
+  });
+  // 记住这次选的项目，下次整窗收藏的浮层默认停在这里（和 claimPendingBatch 一致）。
+  if (chosen.id) await chrome.storage.local.set({ [LAST_PROJECT_KEY]: chosen.id });
+  else await chrome.storage.local.remove(LAST_PROJECT_KEY);
+  // 不弹页内药丸、不动角标：这次的反馈由侧栏自己给（切项目 + 高亮新卡片）。
+  return {
+    ok: true,
+    item: saved.record,
+    projectId: chosen.id,
+    projectName: chosen.name,
+    added: saved.duplicated ? 0 : 1,
+    duplicated: !!saved.duplicated,
+    moved: !!saved.moved,
+    refreshed: !!saved.refreshed
+  };
 }
 
 async function toggleTranslation(tab) {
@@ -813,6 +865,44 @@ async function saveItem(item, options = {}) {
   return saved;
 }
 
+// 把已抓好的元数据写进指定项目：网址收过就搬家（改归属 + 补信息），没收过就新建。
+// 侧栏「选好项目再添加」和整窗批量收藏共用这一段，两条路径的落库语义永远一致。
+// 必须在 queueItemWrite 里跑：里面是「读最新列表 → 改 → 写回」，不串行化的话，
+// 批量抓取期间的单篇保存会被旧快照覆盖。
+// afterId：新记录插到这条之后（批量时保持标签顺序），不传就插到最前。
+async function upsertItemForProject(meta, projectId, { savedAt = Date.now(), afterId = null } = {}) {
+  return queueItemWrite(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEY);
+    const items = stored[STORAGE_KEY] || [];
+    const key = normalizeUrl(meta.url);
+    const existing = items.find((entry) => normalizeUrl(entry.url) === key);
+    if (existing) {
+      const refreshed = mergeDuplicateMetadata(existing, meta);
+      const target = projectId || null;
+      const moved = (existing.projectId || null) !== target;
+      if (moved) existing.projectId = target;
+      if (refreshed || moved) await chrome.storage.local.set({ [STORAGE_KEY]: items });
+      return { record: existing, duplicated: true, refreshed, moved };
+    }
+    const record = {
+      id: crypto.randomUUID(),
+      title: meta.title || meta.url,
+      description: meta.description || "暂无摘要",
+      image: meta.image || "",
+      favicon: meta.favicon || "",
+      source: meta.source || safeHostname(meta.url),
+      projectId,
+      url: meta.url,
+      savedAt,
+      status: "unread"
+    };
+    const afterIndex = afterId ? items.findIndex((entry) => entry.id === afterId) : -1;
+    items.splice(afterIndex + 1, 0, record);
+    await chrome.storage.local.set({ [STORAGE_KEY]: items });
+    return { record, duplicated: false };
+  });
+}
+
 // ── 一键收藏所有标签 ────────────────────────────────────────
 // 入口：快捷键 Alt+Shift+1 或右键菜单。
 // 默认先在当前网页里弹出「选择项目」浮层，选好项目后再真正开始收藏，
@@ -1019,36 +1109,8 @@ async function runBatchSave({ tabs, source = "shortcut", notifyTabId = null, pro
         });
       }
 
-      const saved = await queueItemWrite(async () => {
-        const stored = await chrome.storage.local.get(STORAGE_KEY);
-        const items = stored[STORAGE_KEY] || [];
-        const key = normalizeUrl(meta.url);
-        const existing = items.find((entry) => normalizeUrl(entry.url) === key);
-        if (existing) {
-          const refreshed = mergeDuplicateMetadata(existing, meta);
-          const target = projectId || null;
-          const moved = (existing.projectId || null) !== target;
-          if (moved) existing.projectId = target;
-          if (refreshed || moved) await chrome.storage.local.set({ [STORAGE_KEY]: items });
-          return { record: existing, duplicated: true, refreshed, moved };
-        }
-        const record = {
-          id: crypto.randomUUID(),
-          title: meta.title || meta.url,
-          description: meta.description || "暂无摘要",
-          image: meta.image || "",
-          favicon: meta.favicon || "",
-          source: meta.source || safeHostname(meta.url),
-          projectId,
-          url: meta.url,
-          savedAt: base - i,
-          status: "unread"
-        };
-        const previousIndex = previousAddedId ? items.findIndex((entry) => entry.id === previousAddedId) : -1;
-        items.splice(previousIndex + 1, 0, record);
-        await chrome.storage.local.set({ [STORAGE_KEY]: items });
-        return { record, duplicated: false };
-      });
+      // 落库语义和侧栏「选好项目再添加」共用同一个助手：已收过就搬家，没收过就新建。
+      const saved = await upsertItemForProject(meta, projectId, { savedAt: base - i, afterId: previousAddedId });
       const { record, refreshed, moved } = saved;
       if (saved.duplicated) {
         duplicated += 1;

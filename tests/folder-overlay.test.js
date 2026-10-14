@@ -287,6 +287,29 @@ const PAGES = [
   await tick(300);
   anchor.remove();
 
+  // 侧栏「添加当前网页」用的也是贴按钮的浮层，但那是「新增一篇」而不是「给已有卡片改归属」。
+  // 所以它传 intent:"save"，把措辞从「移动到…」换成「添加到…」。
+  // 不传 intent 时行为不变（上面那一段已经钉住了默认仍是「移动」口径）。
+  const saveAnchor = document.createElement("button");
+  document.body.append(saveAnchor);
+  const savePopover = window.openFolderPicker({
+    anchor: saveAnchor, theme: "light", selected: "work", folders: FOLDERS,
+    intent: "save", titleText: "把这个网页添加到哪个项目？"
+  });
+  const saveShadow = document.getElementById("lateron-folder-picker").shadowRoot;
+  check("仍然是贴按钮的浮层（布局没被 intent 改掉）", saveShadow.querySelector(".lon-root").classList.contains("lon-popover"));
+  check("标题用调用方给的「添加」口径", saveShadow.querySelector(".lon-title").textContent === "把这个网页添加到哪个项目？", saveShadow.querySelector(".lon-title").textContent);
+  check("确认按钮说「添加到…」而不是「移动到…」", saveShadow.querySelector(".lon-primary").textContent === "添加到「工作」", saveShadow.querySelector(".lon-primary").textContent);
+  check("说明文案告诉用户选完就会添加", /选好项目后就会添加这个网页/.test(saveShadow.querySelector(".lon-summary").textContent), saveShadow.querySelector(".lon-summary").textContent);
+  check("输入框提示也是「添加」口径", saveShadow.querySelector(".lon-new-input").placeholder === "输入新项目名，回车直接添加进去", saveShadow.querySelector(".lon-new-input").placeholder);
+  const saveNewField = saveShadow.querySelector(".lon-new-input");
+  saveNewField.value = "灵感库";
+  saveNewField.dispatchEvent(new window.Event("input", { bubbles: true, composed: true }));
+  check("新建项目时同样说「并添加」而不是「并移入」", saveShadow.querySelector(".lon-primary").textContent === "新建「灵感库」并添加", saveShadow.querySelector(".lon-primary").textContent);
+  savePopover.close();
+  await tick(300);
+  saveAnchor.remove();
+
   // 静态锁：品牌标识是在构造时按「整屏 / 浮层」分支渲染的（不是靠 CSS 藏起来），
   // 而且浮层要把标题的上边距收掉——那是当初用来跟品牌行拉开距离的。
   check("品牌标识按「整屏 / 浮层」分支渲染",

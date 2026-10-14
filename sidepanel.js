@@ -54,6 +54,12 @@ let covers = {};           // 用户上传的封面：{ 收藏 id: dataURL }（�
 let loadGeneration = 0;
 const itemMap = new Map();
 let currentItemId = null;     // 当前正在读的文章 id（与全屏界面共享，用于高亮 + 滚动定位）
+// 顶部「添加」在设置打开「先选项目」时会弹出侧栏内的选项目浮层。
+// 浮层开着期间按钮保持不可点；currentTabId 记下打开浮层那一刻的标签页，
+// 这样即使用户中途切了标签页，写库的目标仍然是当初那个网页。
+let pickerOpen = false;
+let panelPicker = null;       // openFolderPicker 返回的 { close } 句柄
+let currentTabId = null;
 // 收藏一多（几百上千条），一次性把卡片全画出来会把主线程占住好几秒——
 // 界面在这期间是一点不动的白屏。所以分批画：先快速画出第一屏，
 // 剩下的排在浏览器空闲时继续。（放在文件靠前的位置：init() 会立刻用到它们）
@@ -450,6 +456,24 @@ function ensureDialogLoaded() {
   return dialogLoadPromise;
 }
 
+// 选项目浮层同样不是首屏能力，而且只对打开了「添加当前网页前先选项目」的用户有用：
+// 同样按需加载。样式全部内联在浮层自己的 shadow root 里，所以不需要额外加载 CSS。
+let pickerLoadPromise = null;
+function ensurePickerLoaded() {
+  if (typeof window.openFolderPicker === "function") return Promise.resolve(window.openFolderPicker);
+  if (pickerLoadPromise) return pickerLoadPromise;
+  pickerLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "picker-ui.js";
+    script.onload = () => typeof window.openFolderPicker === "function"
+      ? resolve(window.openFolderPicker)
+      : reject(new Error("选项目浮层未就绪"));
+    script.onerror = () => reject(new Error("选项目浮层加载失败"));
+    document.head.append(script);
+  });
+  return pickerLoadPromise;
+}
+
 // 给 Promise 加超时：到点就返回兜底值，绝不让界面无限期等下去。
 function withTimeout(promise, ms, fallback) {
   return new Promise((resolve) => {
@@ -478,6 +502,8 @@ async function loadCurrentPage() {
         : tr("browserPageUnsupported"));
     }
     const fallback = fallbackMetadata(tab);
+    // 记下这个标签页：选项目浮层打开期间用户可能切走，写库时要认准当初这一页。
+    currentTabId = tab.id;
     // 第一段：立刻显示，按钮放开，不等后台。
     applyCurrentPage({ ...fallback, url: tab.url }, generation);
     // 第二段：抓取交给后台，和「一键收藏」「弹窗」共用同一份逻辑。
@@ -506,7 +532,12 @@ function applyCurrentPage(result, generation, options) {
   if (currentItem.image) setCurrentThumb(currentItem.image);
 }
 
-chrome.tabs.onActivated.addListener(() => loadCurrentPage());
+chrome.tabs.onActivated.addListener(() => {
+  // 选项目浮层是为「当初那个网页」弹的：切了标签页它的上下文就失效了，
+  // 直接收起来，免得用户对着新页面点确认却存了旧页面。
+  closePanelPicker();
+  loadCurrentPage();
+});
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (tab.active && (changeInfo.status === "complete" || changeInfo.url)) loadCurrentPage();
 });
@@ -583,11 +614,155 @@ function syncCurrentTabItem(url, { followProject = true } = {}) {
   window.scrollTo({ top: 0, behavior: "auto" });
 }
 
+// ── 侧栏内「选项目」浮层 ──────────────────────────────────────
+// 设置里打开「添加当前网页前，先选项目」后，顶部「添加」不再直接收进「等待整理」，
+// 而是贴着按钮弹一个项目列表，选好再写库。
+// 浮层复用 picker-ui.js 的 openFolderPicker（和全屏卡片「改所属项目」、网页内收藏浮层
+// 是同一份 UI），所以这里只负责准备数据、接回调和处理结果，不写任何样式。
+
+function closePanelPicker() {
+  if (!pickerOpen) return;
+  pickerOpen = false;
+  const handle = panelPicker;
+  panelPicker = null;
+  handle?.close?.();
+}
+
+// 浮层用的项目列表：形状和网页内浮层（background.js 的 showPickerOverlay）、
+// 全屏页（library.js 的 projectPickerFolders）保持一致——
+// 第一项 id 为空字符串，代表「等待整理」这个不是真实项目记录的收件箱。
+function panelPickerFolders() {
+  const counts = new Map();
+  let unfiled = 0;
+  for (const item of items) {
+    if (item.projectId) counts.set(item.projectId, (counts.get(item.projectId) || 0) + 1);
+    else unfiled += 1;
+  }
+  // 封面：优先项目自定义封面，否则取该项目里第一张能解析出图的收藏（和全屏页同一套规则）。
+  const coverFor = (projectId) => {
+    const project = projects.find((entry) => entry.id === projectId);
+    if (project?.cover) return project.cover;
+    const first = items.find((entry) => (entry.projectId || "") === projectId && resolveImage(entry));
+    return first ? resolveImage(first) : "";
+  };
+  return [
+    { id: "", name: tr("inbox"), count: unfiled, cover: coverFor("") },
+    ...projects.map((project) => ({
+      id: project.id,
+      name: project.name,
+      count: counts.get(project.id) || 0,
+      cover: coverFor(project.id)
+    }))
+  ];
+}
+
+// 新建项目统一走后台（和网页内浮层、全屏页同一份逻辑）。
+// 侧栏的 projects 会被 storage.onChanged(PROJECTS_KEY) 自动刷新，这里不用手动同步。
+async function createProjectFromPicker(name) {
+  const response = await chrome.runtime.sendMessage({ type: "CREATE_PROJECT", name }).catch(() => null);
+  return response?.project || null;
+}
+
+// 把当前网页写进指定项目，成功后再切项目、高亮新卡片。
+async function saveCurrentTabToProject(projectId) {
+  const response = await chrome.runtime.sendMessage({
+    type: "SAVE_TAB_TO_PROJECT",
+    projectId: projectId || null,
+    tabId: currentTabId,
+    source: "panel"
+  }).catch(() => null);
+
+  if (!response?.ok) return { ok: false, error: response?.error || tr("saveFailed") };
+
+  // 先把后台写好的那条并进本地列表，再渲染。等 storage.onChanged 的话会有一次
+  // 明显延迟，新卡片还没画出来就去定位，会定位不到。
+  const record = response.item;
+  if (record) {
+    const index = items.findIndex((entry) => entry.id === record.id);
+    items = index >= 0
+      ? items.map((entry) => (entry.id === record.id ? record : entry))
+      : [record, ...items];
+  }
+
+  syncSaveButtonState(true);
+  status.textContent = "";
+  focusProjectAndItem(response.projectId, record?.id);
+  return { ok: true };
+}
+
+// 添加成功后：切到目标项目，并把新卡片高亮 + 滚进视野。
+// 这里的写法与 syncCurrentTabItem() 里「跟随标签页切换项目」那一段一致，
+// 定位本身交给现成的 applyCurrentAndLocate()（它会等列表铺完再定位）。
+function focusProjectAndItem(projectId, itemId) {
+  activeProject = projectId ? normalizeProject(projectId) : "unfiled";
+  if (itemId) currentItemId = itemId;
+  renderProjectFilters();
+  render();
+  chrome.storage.local.set({ [ACTIVE_PROJECT_KEY]: activeProject }).catch(() => {});
+  if (itemId) chrome.storage.local.set({ [CURRENT_ITEM_KEY]: itemId }).catch(() => {});
+  applyCurrentAndLocate();
+}
+
+async function openPanelProjectPicker(settings) {
+  if (pickerOpen) return;
+  pickerOpen = true;
+  saveButton.disabled = true;
+  try {
+    const openPicker = await ensurePickerLoaded();
+    // 语言必须显式传：picker-ui 不读 LaterOnI18n，文案是它自己内联的两份。
+    // intent:"save" 让它说「添加到…」而不是贴按钮时默认的「移动到…」。
+    panelPicker = openPicker({
+      anchor: saveButton,
+      theme: settings.theme || "light",
+      language: settings.language === "en" ? "en" : "zh-CN",
+      folders: panelPickerFolders(),
+      selected: activeProject === "unfiled" ? "" : activeProject,
+      intent: "save",
+      titleText: tr("chooseProjectForPage"),
+      onCreateProject: createProjectFromPicker,
+      onCancel: () => {
+        pickerOpen = false;
+        panelPicker = null;
+        syncSaveButtonState(!!currentItemId);
+      },
+      onPick: async (projectId) => {
+        const result = await saveCurrentTabToProject(projectId);
+        if (result.ok) {
+          pickerOpen = false;
+          panelPicker = null;
+          return { ok: true };
+        }
+        // 失败时浮层不关闭（picker-ui 的约定：返回 ok:false 就留在原地显示错误）。
+        // 所以 pickerOpen 保持 true、按钮继续不可点，免得用户又点出一个新浮层。
+        return { ok: false, error: result.error };
+      }
+    });
+  } catch (error) {
+    console.error("选项目浮层打开失败", error);
+    pickerOpen = false;
+    panelPicker = null;
+    saveButton.disabled = false;
+    status.textContent = tr("saveFailed");
+  }
+}
+
 saveButton.addEventListener("click", async () => {
   if (!currentItem || currentItemId) return;
+  if (pickerOpen) return;
+
+  // 设置里打开「添加当前网页前，先选项目」时，改弹侧栏自己的浮层，选好项目再添加。
+  // 这条分支刻意不再调用 QUICK_SAVE_TAB：那条路会在网页里再弹一个选项目浮层，
+  // 和侧栏刚弹过的重复。判断口径与后台的 shouldAskFolderForSingle() 完全一致
+  // （LaterOnSettings.get 内部已经处理过「用户有没有主动开过」的迁移标记）。
+  let settings = null;
+  try { settings = await window.LaterOnSettings?.get?.(); } catch { settings = null; }
+  if (settings?.askFolderOnSingle === true) {
+    await openPanelProjectPicker(settings);
+    return;
+  }
+
   saveButton.disabled = true;
-  // 统一交给后台处理（和快捷键、右键菜单同一条链路）：
-  // 设置里打开「收藏单篇前先选项目」时，点这里同样会先在网页里弹出选项目浮层。
+  // 统一交给后台处理（和快捷键、右键菜单同一条链路）。
   const response = await chrome.runtime.sendMessage({ type: "QUICK_SAVE_TAB", source: "panel" }).catch(() => null);
   if (response?.ok && response.pending) {
     // 已经弹出浮层了，真正的收藏等用户在浮层里确认（结果会弹在网页上）。

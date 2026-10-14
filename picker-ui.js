@@ -30,6 +30,11 @@
   function openFolderPicker(options) {
     const data = options || {};
     const isPopover = !!data.anchor;
+    // 措辞（「添加」还是「移动」）和形态（贴按钮的浮层还是整屏弹窗）是两件事，刻意分开：
+    // 贴按钮的浮层原本只用在收藏库卡片上「改所属项目」，所以默认说「移动」；
+    // 侧栏「添加当前网页」也要贴按钮，但那是新增而不是搬家，得传 intent:"save" 换成添加措辞。
+    // 不传 intent 时维持老行为：整屏=添加，贴按钮=移动。
+    const intent = data.intent === "save" || (!data.intent && !isPopover) ? "save" : "move";
     const language = data.language === "en" || (!data.language && document.documentElement.lang === "en") ? "en" : "zh-CN";
     const copy = language === "en" ? {
       projects: "Choose a project", newProject: "New project name", cancel: "Cancel", moveTitle: "Move this save to which project?",
@@ -129,11 +134,18 @@
     const confirmBtn = $(".lon-primary");
     const cancelBtn = $(".lon-ghost");
 
-    // 标题 / 摘要 / 页面清单：浮层（改卡片项目）和整屏弹窗（收藏网页）文案不同。
+    // 标题 / 摘要 / 页面清单：贴按钮的浮层（改卡片项目、侧栏添加）和整屏弹窗（收藏网页）文案不同。
     if (isPopover) {
-      $(".lon-title").textContent = data.titleText || copy.moveTitle;
-      summaryEl.textContent = "";
+      // 贴按钮的浮层永远只处理当前这一篇，不列页面清单。
       $(".lon-pages").hidden = true;
+      if (intent === "save") {
+        // 侧栏「添加当前网页」：说清楚选完就添加，别让人以为只是改归属。
+        $(".lon-title").textContent = data.titleText || copy.saveSingleTitle;
+        summaryEl.textContent = savedCount > 0 ? copy.singleSaved : copy.singleNew;
+      } else {
+        $(".lon-title").textContent = data.titleText || copy.moveTitle;
+        summaryEl.textContent = "";
+      }
     } else {
       const single = pages.length <= 1;
       // 整屏弹窗的默认标题；单篇收藏时再换成更具体的那句。
@@ -160,7 +172,7 @@
       pageList.append(li);
     });
 
-    newInput.placeholder = isPopover ? copy.newMove : copy.newSave;
+    newInput.placeholder = intent === "save" ? copy.newSave : copy.newMove;
 
     // 输入框里写下的新项目名（空 = 用上面选中的那个项目）。
     const pendingNewName = () => newInput.value.trim();
@@ -173,11 +185,11 @@
       if (name) {
         confirmBtn.textContent = busy
           ? copy.processing
-          : (isPopover ? copy.createMove(name) : copy.createSave(name));
+          : (intent === "save" ? copy.createSave(name) : copy.createMove(name));
       } else {
         confirmBtn.textContent = busy
           ? copy.processing
-          : (isPopover ? copy.moveTo(selectedName()) : copy.saveTo(selectedName()));
+          : (intent === "save" ? copy.saveTo(selectedName()) : copy.moveTo(selectedName()));
       }
     };
 
